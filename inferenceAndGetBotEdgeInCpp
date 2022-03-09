@@ -1,0 +1,395 @@
+#include <assert.h>
+#include <vector>
+#include <ctime>
+#include <iostream>
+#include <onnxruntime_cxx_api.h>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/videoio.hpp>
+#include<opencv2/dnn.hpp>
+#include "opencv2/imgproc/imgproc_c.h"
+using namespace cv;
+using namespace std;
+
+class U2NetModel
+{
+public:
+    U2NetModel(const wchar_t* onnx_model_path);
+    //实际在进行inference时， 输入和输出都是vector<float>形式，要将数据展平
+    //第二个predict是对网络输入输出分别进行前处理和后处理
+    std::vector<float> predict(std::vector<float>& input_data, int batch_size = 1, int index = 0);
+    cv::Mat predict(cv::Mat& input_tensor, int batch_size = 1, int index = 0);
+private:
+    Ort::Env env;
+    Ort::Session session;
+    Ort::AllocatorWithDefaultOptions allocator;
+    std::vector<const char*>input_node_names;
+    std::vector<const char*>output_node_names;
+    std::vector<int64_t> input_node_dims;
+    std::vector<int64_t> output_node_dims;
+};
+
+U2NetModel::U2NetModel(const wchar_t* onnx_model_path) :session(nullptr), env(nullptr)//传入空指针给sessionh和nullptr，相当于初始化？
+{
+    //初始化环境，每个进程一个环境,环境保留了线程池和其他状态信息
+    this->env = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "u2net");
+    //初始化Session选项
+    Ort::SessionOptions session_options;
+    session_options.SetInterOpNumThreads(4);
+    session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    // 创建Session并把模型加载到内存中
+    this->session = Ort::Session(env, onnx_model_path, session_options);
+    //输入输出节点数量
+    size_t num_input_nodes = session.GetInputCount();
+    size_t num_output_nodes = session.GetOutputCount();
+    for (int i = 0; i < num_input_nodes; i++)
+    {
+        auto input_node_name = session.GetInputName(i, allocator);
+        this->input_node_names.push_back(input_node_name);
+
+
+        Ort::TypeInfo type_info = session.GetInputTypeInfo(i);
+        auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+        ONNXTensorElementDataType type = tensor_info.GetElementType();
+        this->input_node_dims = tensor_info.GetShape();
+    }
+    for (int i = 0; i < num_output_nodes; i++)
+    {
+        auto output_node_name = session.GetOutputName(i, allocator);
+        this->output_node_names.push_back(output_node_name);
+        Ort::TypeInfo type_info = session.GetOutputTypeInfo(i);
+        auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+        this->output_node_dims = tensor_info.GetShape();
+    }
+}
+
+
+
+
+std::vector<float> U2NetModel::predict(std::vector<float>& input_tensor_values, int batch_size, int index)
+{
+    std::cout << "调用了predict1" << std::endl;
+    //需要对inout_node_dims进行修改，改成批次数量
+    this->input_node_dims[0] = batch_size;
+    this->output_node_dims[0] = batch_size;
+    float* floatarr = nullptr;
+    try
+    {
+        std::vector<const char*>output_node_names;
+        if (index != -1)
+        {
+            output_node_names = { this->output_node_names[index] };
+        }
+        else
+        {
+            output_node_names = this->output_node_names;
+        }
+        this->input_node_dims[0] = batch_size;
+        auto input_tensor_size = input_tensor_values.size();
+
+        auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+
+        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, input_tensor_values.data(), input_tensor_size, input_node_dims.data(), 4);
+        auto output_tensors = session.Run(Ort::RunOptions{ nullptr }, input_node_names.data(), &input_tensor, 1, output_node_names.data(), 1);
+
+
+        assert(output_tensors.size() == 1 && output_tensors.front().IsTensor());//如果括号内为False，则程序终止执行
+
+        floatarr = output_tensors.front().GetTensorMutableData<float>();
+    }
+    catch (Ort::Exception& e)
+    {
+        throw e;
+    }
+    int64_t output_tensor_size = 1;
+    for (auto& it : this->output_node_dims)
+    {
+        output_tensor_size *= it;
+    }
+    std::vector<float>results(output_tensor_size);
+    for (unsigned i = 0; i < output_tensor_size; i++)
+    {
+        results[i] = floatarr[i];
+    }
+    return results;
+}
+
+
+
+cv::Mat U2NetModel::predict(cv::Mat& input_tensor, int batch_size, int index)
+{
+
+    std::cout << "调用了predict2" << std::endl;
+    int input_tensor_size = input_tensor.cols * input_tensor.rows * 3;
+    std::size_t counter = 0;//std::vector空间一次性分配完成，避免过多的数据copy，size_t可以存储所有数据理论上的最大size数，包括array，使用了它就不担心counter会溢出
+    std::vector<float>input_data(input_tensor_size);
+    std::vector<float>output_data;
+    try
+    {
+        for (unsigned k = 0; k < 3; k++)
+        {
+            for (unsigned i = 0; i < input_tensor.rows; i++)
+            {
+                for (unsigned j = 0; j < input_tensor.cols; j++)
+                {
+                    //input_data[counter++] = static_cast<float>(input_tensor.at<cv::Vec3b>(i, j)[k]) / 255.0;
+                    if(k == 0)
+                        input_data[counter++] = (static_cast<float>(input_tensor.at<cv::Vec3b>(i, j)[k]) - 112.2 )/ 56.1;
+                    if(k == 1)
+                        input_data[counter++] = (static_cast<float>(input_tensor.at<cv::Vec3b>(i, j)[k]) - 114.75) / 56.1;
+                    if(k == 2)
+                        input_data[counter++] = (static_cast<float>(input_tensor.at<cv::Vec3b>(i, j)[k]) - 112.2) / 56.1;//三通道，8U用cv::Vec3b,单通道用uchar,
+                }
+            }
+        }
+    }
+    //inputdata的读取顺序为，依此读取每点的三个channel下的值，RGB，点的顺序为先列后行，转换成vector<float>
+    catch (cv::Exception& e)
+    {
+        printf(e.what());
+    }
+    try
+    {
+        output_data = this->predict(input_data);
+        //先调用了p2，在p2中调用了p1
+    }
+    catch (Ort::Exception& e)
+    {
+        throw e;
+    }
+    cv::Mat output_tensor(output_data);//相当于类型转换，将vector<float>转换为output_data
+    //std::cout << output_tensor.channels() << std::endl;
+    output_tensor = output_tensor.reshape(1, { 512,512 }) * 255.0;
+    //output_tensor = 255.0 - output_tensor.reshape(1, { 512,512 }) * 255.0;
+    //cv::threshold(output_tensor, output_tensor, 100, 255, cv::THRESH_BINARY_INV);
+
+    return output_tensor;
+}
+
+int myLine(cv::Mat& huaban, cv::Point p, cv::Point np, int color)
+{
+    //有很多点是垂直上升的
+    for (float t = 0; t <= 1; t += 0.05)
+    {
+        int x = p.x + (np.x - p.x) * t;
+        int y = p.y + (np.y - p.y) * t;
+
+        huaban.at<uchar>(y, x) = color;
+
+    }
+    return 0;
+}
+
+cv::Mat myDrawContours(cv::Mat& huaban, vector<cv::Point> contour)//huaban为8UC1
+{
+    cv::Point p, np;
+    for (int i = 0; i != contour.size() -1; i++)
+    {
+        p.x = contour.at(i).x;
+        p.y = contour.at(i).y;
+
+        np.x = contour.at(i + 1).x;
+        np.y = contour.at(i + 1).y;
+       
+        myLine(huaban, p, np, 255);
+    }
+    return huaban;
+}
+
+float meanX(vector<cv::Point> contour)
+{
+    float meanx;
+    int sumx = 0;
+    int conLen = contour.size();
+
+    for (int i = 0; i != contour.size(); i++)
+    {
+        sumx += contour[i].x;
+    }
+    meanx = sumx / conLen;
+    return meanx;
+}
+
+cv::Mat contoursBreak(cv::Mat &huaban, vector<vector<cv::Point>> contourss)//输入为二值图
+{
+    int areaThre = 1300;
+    vector<vector<cv::Point>> contours;
+    if (contourss.size() > 1)
+    {
+        if (cv::contourArea(contourss[1]) > areaThre)
+        {
+            if (meanX(contourss[0]) > meanX(contourss[1]))
+            {
+                contours.push_back(contourss[1]);
+                contours.push_back(contourss[0]);
+            }
+            else
+            {
+                contours.push_back(contourss[0]);
+                contours.push_back(contourss[1]);
+            }
+
+        }
+    }
+    else
+        contours[0] = contourss[0];
+    
+
+    //////无论怎样，反正总会是会有一个contour的，先对这个contour画出下边界
+    //先对左边的画出下边界
+    {
+        vector<cv::Point>  bottomCon;
+        float xmax = contours[0][0].x, ymax = contours[0][0].y;
+        int argxmax = 0, argymax = 0;
+
+        for (int i = 0; i < contours[0].size(); i++)
+        {
+            if (contours[0][i].x >= xmax)
+            {
+                xmax = contours[0][i].x;
+                argxmax = i;
+            }
+            if (contours[0][i].y >= ymax)
+            {
+                ymax = contours[0][i].y;
+                argymax = i;
+            }
+        }
+
+        if (contours.size() > 1)
+        {
+            int conLen = contours[0].size();
+            int botConL = abs(argxmax - argymax);
+            if ((botConL*1.0 / conLen) / conLen < 2.0 / 5)
+            {
+                if (argymax > argxmax)
+                    argxmax = max(0, int(argxmax - 2.0 / 5 * conLen));
+                if (argymax < argxmax)
+                    argxmax = min(conLen, int(argxmax + 2.0 / 5 * conLen));
+            }
+        }
+
+        int a = max(argxmax, argymax), b = min(argxmax, argymax);
+
+        argxmax = b;
+        argymax = a;
+
+        for (int i = argxmax; i <= argymax - 1; i++)
+        {
+            bottomCon.push_back(contours[0][i]);
+        }
+        
+
+        myDrawContours(huaban, bottomCon);
+    }
+    //////
+
+    if(contours.size() > 1 && cv::contourArea(contours[1]) >1300 )
+    {
+        
+
+        float xmax = contours[1][0].x, xmin = contours[1][0].x;
+        int argxmax = 0, argxmin = 0;
+        vector<cv::Point>  bottomCon;
+
+        for (int i = 0; i < contours[1].size(); i++)
+        {
+            if (contours[1][i].x >= xmax)
+            {
+                xmax = contours[1][i].x;
+                argxmax = i;
+            }
+            if (contours[1][i].x <= xmin)
+            {
+                xmin = contours[1][i].x;
+                argxmin = i;
+            }
+        }
+
+        int a = max(argxmax, argxmin), b = min(argxmax, argxmin);
+
+        argxmax = a;
+        argxmin = b;
+
+        for (int i = argxmin; i < argxmax; i++)
+        {
+            bottomCon.push_back(contours[1][i]);
+        }
+        
+
+        myDrawContours(huaban, bottomCon);
+
+    }
+
+    return huaban;
+}
+
+
+
+
+
+
+
+cv::Mat getBottomEdge(cv::Mat img)//result只知道是单通道
+{
+    img.convertTo(img, CV_8UC1);
+
+    vector<vector<cv::Point>> contours;
+    
+    cv::findContours(img, contours, cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE);
+    
+    sort(contours.begin(), contours.end(), [](const vector<Point>& c1, const vector<Point>& c2) {
+        return contourArea(c1, false) > contourArea(c2, false);
+        });//smallest argument is 0, biggest is contours.size()-1
+    //在这里改了一下，将不等号改变了方向，这样应该就是面积最大的在前面吧
+
+    cv::Mat huaban = Mat::zeros(512, 512, CV_8UC1);
+
+    cv::Mat result = contoursBreak(huaban, contours);
+
+    return result;
+
+
+    
+}
+
+
+
+
+
+int main(int argc, char* argv[])
+{
+       U2NetModel model(L"F:\\data\\parameters\\mobilenetv3_small.onnx");
+       cv::Mat image = cv::imread("F:\\data\\train\\3.bmp");
+       cv::Mat out;
+
+       if (image.cols == 0) {
+           std::cout << "Error reading file " <<  std::endl;
+           return -1;
+       }
+       //cv::resize(image,image, cv::Size(512,512 ) );//调整大小到320*320
+       cv::cvtColor(image, image, cv::COLOR_BGR2RGB);                  //BRG格式转化为RGB格式
+       auto result = model.predict(image);                               //模型预测
+       imshow("result", result);
+
+       //上述得到了result的图片，之后便是对result进行处理
+      
+
+       cv::Mat huaban = Mat::zeros(512, 512, CV_8UC1);
+       cv::Point a;
+       cv::Point b;
+       a.x = 1;
+       a.y = 1;
+       b.x = 512;
+       b.y = 512;
+
+
+       out = getBottomEdge(result);
+       imshow("out", out);
+       waitKey(20000);
+}
+
+
+
